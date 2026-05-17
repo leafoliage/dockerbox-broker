@@ -33,17 +33,24 @@ var debugEnabled bool
 
 var fileLogger *log.Logger
 
-func logLine(format string, args ...any) {
-	if fileLogger != nil {
-		fileLogger.Print(fmt.Sprintf(format, args...))
+const timeFmt = "2006-01-02 15:04:05"
+
+func logf(level, format string, args ...any) {
+	if fileLogger == nil {
+		return
+	}
+	fileLogger.Printf("[%s] [%s] %s", time.Now().Format(timeFmt), level, fmt.Sprintf(format, args...))
+}
+
+func logDebug(format string, args ...any) {
+	if debugEnabled {
+		logf("DEBUG", format, args...)
 	}
 }
 
-func debugLog(format string, args ...any) {
-	if debugEnabled && fileLogger != nil {
-		fileLogger.Printf("DEBUG "+format, args...)
-	}
-}
+func logInfo(format string, args ...any)  { logf("INFO ", format, args...) }
+func logWarn(format string, args ...any)  { logf("WARN ", format, args...) }
+func logError(format string, args ...any) { logf("ERROR", format, args...) }
 
 // --- Docker API types ---
 
@@ -66,8 +73,8 @@ type PortBinding struct {
 
 // ContainerInspect is a minimal slice of docker inspect output.
 type ContainerInspect struct {
-	ID   string `json:"Id"`
-	Name string `json:"Name"`
+	ID              string `json:"Id"`
+	Name            string `json:"Name"`
 	NetworkSettings struct {
 		Ports map[string][]PortBinding `json:"Ports"`
 	} `json:"NetworkSettings"`
@@ -159,7 +166,6 @@ func (r *ContainerRegistry) snapshot() []StatusEntry {
 	return entries
 }
 
-
 // ids returns the set of container IDs currently in the registry.
 func (r *ContainerRegistry) ids() map[string]bool {
 	r.mu.RLock()
@@ -193,7 +199,7 @@ func serveStatus(reg *ContainerRegistry) {
 
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
-		logLine("ERROR: status socket listen %s: %v\n", socketPath, err)
+		logError("status socket listen %s: %v", socketPath, err)
 		return
 	}
 	defer ln.Close()
@@ -202,12 +208,12 @@ func serveStatus(reg *ContainerRegistry) {
 	// Restrict access to root only.
 	os.Chmod(socketPath, 0600)
 
-	debugLog("status socket listening on %s", socketPath)
+	logDebug("status socket listening on %s", socketPath)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			debugLog("status socket accept error: %v", err)
+			logDebug("status socket accept error: %v", err)
 			return
 		}
 		go func(c net.Conn) {
@@ -267,7 +273,7 @@ func handleConn(ctx context.Context, src net.Conn, target string) {
 
 	dst, err := net.Dial("tcp", target)
 	if err != nil {
-		debugLog("forward: dial %s failed: %v", target, err)
+		logDebug("forward: dial %s failed: %v", target, err)
 		return
 	}
 	defer dst.Close()
@@ -296,7 +302,7 @@ func handleConn(ctx context.Context, src net.Conn, target string) {
 func forwardPort(ctx context.Context, listenAddr, targetAddr string) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		logLine("[forwarder] ERROR listen %s: %v\n", listenAddr, err)
+		logError("forwarder: listen %s: %v", listenAddr, err)
 		return
 	}
 
@@ -306,7 +312,7 @@ func forwardPort(ctx context.Context, listenAddr, targetAddr string) {
 		ln.Close()
 	}()
 
-	debugLog("forward: listening on %s -> %s", listenAddr, targetAddr)
+	logDebug("forward: listening on %s -> %s", listenAddr, targetAddr)
 
 	for {
 		conn, err := ln.Accept()
@@ -314,7 +320,7 @@ func forwardPort(ctx context.Context, listenAddr, targetAddr string) {
 			if ctx.Err() != nil {
 				return
 			}
-			debugLog("forward: accept error on %s: %v", listenAddr, err)
+			logDebug("forward: accept error on %s: %v", listenAddr, err)
 			return
 		}
 		go handleConn(ctx, conn, targetAddr)
@@ -322,7 +328,7 @@ func forwardPort(ctx context.Context, listenAddr, targetAddr string) {
 }
 
 // startForwarders spawns one forwardPort goroutine per host-port binding.
-func startForwarders(ctx context.Context, name string, ts string, ports map[string][]PortBinding) {
+func startForwarders(ctx context.Context, name string, ports map[string][]PortBinding) {
 
 	for containerPort, bindings := range ports {
 		for _, b := range bindings {
@@ -330,15 +336,14 @@ func startForwarders(ctx context.Context, name string, ts string, ports map[stri
 				continue
 			}
 			if b.HostIP != "" && b.HostIP != "0.0.0.0" {
-				debugLog("forward: skipping non-default binding %s:%s", b.HostIP, b.HostPort)
+				logDebug("forward: skipping non-default binding %s:%s", b.HostIP, b.HostPort)
 				continue
 			}
 
 			listenAddr := fmt.Sprintf(":%s", b.HostPort)
 			targetAddr := fmt.Sprintf("%s:%s", dockerHost, b.HostPort)
 
-			logLine("[%s] FORWARD %-20s :%s -> %s:%s (%s)\n",
-				ts, name, b.HostPort, dockerHost, b.HostPort, containerPort)
+			logInfo("FORWARD %-20s :%s -> %s:%s (%s)", name, b.HostPort, dockerHost, b.HostPort, containerPort)
 
 			go forwardPort(ctx, listenAddr, targetAddr)
 		}
@@ -399,20 +404,15 @@ func shortID(id string) string {
 	return id
 }
 
-func timestamp(unix int64) string {
-	return time.Unix(unix, 0).Format("15:04:05")
-}
-
 // --- Event handling ---
 
 func handleStart(event DockerEvent, reg *ContainerRegistry) {
 	id := event.Actor.ID
 	name := event.Actor.Attributes["name"]
-	ts := timestamp(event.Time)
 
 	info, err := inspectContainer(id)
 	if err != nil {
-		logLine("[%s] WARN: could not inspect %s (%s): %v\n", ts, name, shortID(id), err)
+		logWarn("could not inspect %s (%s): %v", name, shortID(id), err)
 		return
 	}
 
@@ -422,9 +422,8 @@ func handleStart(event DockerEvent, reg *ContainerRegistry) {
 	reg.add(id, &ContainerEntry{ports: ports, cancel: cancel})
 
 	if len(ports) > 0 {
-		logLine("[%s] START   %-20s %s  ports: %s\n",
-			ts, name, shortID(id), formatPorts(ports))
-		startForwarders(ctx, name, ts, ports)
+		logInfo("START   %-20s %s  ports: %s", name, shortID(id), formatPorts(ports))
+		startForwarders(ctx, name, ports)
 	} else {
 		cancel()
 	}
@@ -434,7 +433,6 @@ func handleDie(event DockerEvent, reg *ContainerRegistry) {
 	id := event.Actor.ID
 	name := event.Actor.Attributes["name"]
 	exitCode := event.Actor.Attributes["exitCode"]
-	ts := timestamp(event.Time)
 
 	ports, ok := reg.remove(id)
 	portStr := "(unknown — not seen at start)"
@@ -442,8 +440,7 @@ func handleDie(event DockerEvent, reg *ContainerRegistry) {
 		portStr = formatPorts(ports)
 	}
 
-	logLine("[%s] DIE     %-20s %s  exit=%s  ports released: %s\n",
-		ts, name, shortID(id), exitCode, portStr)
+	logInfo("DIE     %-20s %s  exit=%s  ports released: %s", name, shortID(id), exitCode, portStr)
 }
 
 // reconcile fetches the current live container list from Docker and brings the
@@ -484,7 +481,6 @@ func reconcile(reg *ContainerRegistry, logPrefix string) error {
 
 	// Add containers not yet tracked.
 	known := reg.ids()
-	ts := timestamp(time.Now().Unix())
 	for _, c := range containers {
 		if known[c.ID] {
 			continue // already tracked, forwarders already running
@@ -493,7 +489,7 @@ func reconcile(reg *ContainerRegistry, logPrefix string) error {
 
 		info, err := inspectContainer(c.ID)
 		if err != nil {
-			logLine("[%s] WARN: %s: could not inspect %s (%s): %v\n", ts, logPrefix, name, shortID(c.ID), err)
+			logWarn("%s: could not inspect %s (%s): %v", logPrefix, name, shortID(c.ID), err)
 			continue
 		}
 
@@ -502,8 +498,8 @@ func reconcile(reg *ContainerRegistry, logPrefix string) error {
 		reg.add(c.ID, &ContainerEntry{ports: ports, cancel: cancel})
 
 		if len(ports) > 0 {
-			logLine("[%s] %-8s %-20s %s  ports: %s\n", ts, logPrefix, name, shortID(c.ID), formatPorts(ports))
-			startForwarders(ctx, name, ts, ports)
+			logInfo("%-8s %-20s %s  ports: %s", logPrefix, name, shortID(c.ID), formatPorts(ports))
+			startForwarders(ctx, name, ports)
 		} else {
 			cancel()
 		}
@@ -530,14 +526,14 @@ func connectAndReconcile(reg *ContainerRegistry, logPrefix string) (*json.Decode
 		return nil, nil, fmt.Errorf("events endpoint returned HTTP %d: %s", resp.StatusCode, body)
 	}
 
-	logLine("Connected to %s — reconciling...", dockerBase)
+	logInfo("connected to %s — reconciling...", dockerBase)
 
 	if err := reconcile(reg, logPrefix); err != nil {
 		resp.Body.Close()
 		return nil, nil, fmt.Errorf("reconcile failed: %w", err)
 	}
 
-	logLine("Reconcile done — watching for port binding changes...")
+	logInfo("reconcile done — watching for port binding changes...")
 
 	cleanup := func() { resp.Body.Close() }
 	return json.NewDecoder(resp.Body), cleanup, nil
@@ -552,8 +548,7 @@ func consumeEvents(decoder *json.Decoder, reg *ContainerRegistry) error {
 			return fmt.Errorf("stream error: %w", err)
 		}
 
-		debugLog("DEBUG event: Type=%s Action=%s ID=%s Name=%s",
-			event.Type, event.Action, shortID(event.Actor.ID), event.Actor.Attributes["name"])
+		logDebug("event: Type=%s Action=%s ID=%s Name=%s", event.Type, event.Action, shortID(event.Actor.ID), event.Actor.Attributes["name"])
 
 		if event.Type != "container" {
 			continue
@@ -592,7 +587,7 @@ func runDaemon() {
 	defer f.Close()
 	fileLogger = log.New(f, "", 0)
 
-	fileLogger.Printf("started; writing output to %s (debug=%v)", logFilePath, debugEnabled)
+	logInfo("started; writing output to %s (debug=%v)", logFilePath, debugEnabled)
 
 	reg := newRegistry()
 
@@ -601,12 +596,12 @@ func runDaemon() {
 	for {
 		decoder, cleanup, err := connectAndReconcile(reg, "EXISTS")
 		if err != nil {
-			logLine("ERROR: %v — retrying in 5s...\n", err)
+			logError("%v — retrying in 5s...", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 		if err := consumeEvents(decoder, reg); err != nil {
-			logLine("ERROR: %v — reconnecting in 5s...\n", err)
+			logError("%v — reconnecting in 5s...", err)
 		}
 		cleanup()
 		time.Sleep(5 * time.Second)
