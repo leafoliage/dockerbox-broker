@@ -1,4 +1,4 @@
-NAME=           docker-broker
+NAME=           dockerbox-broker
 PREFIX?=        /usr/local
 SBINDIR?=       ${PREFIX}/sbin
 RCDDIR?=        ${PREFIX}/etc/rc.d

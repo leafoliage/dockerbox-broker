@@ -1,6 +1,6 @@
-# Docker-Broker
+# Dockerbox-Broker
 
-Docker broker currently maintains port forwarding from localhost to remote TCP docker host for ports binded on the remote host.
+Dockerbox broker currently maintains port forwarding from localhost to remote TCP docker host for ports binded on the remote host.
 
 ## Prerequisites
 
@@ -8,28 +8,33 @@ A remote docker host listening on a TCP port.
 
 ## Quickstart
 
-Configure `.env`
-
-```
-DOCKER_BASE=http://10.0.0.1:2375    # The port remote host is listening on
-LOG_FILE_PATH=./docker-observe.log  # Set log file path
-```
-
-Start docker broker daemon.
+Install dockerbox broker.
 
 ```sh
-./daemon.sh build
-./daemon.sh start
+make install
 ```
 
-Check status
+Configure `/usr/local/etc/dockerbox-broker/dockerbox-broker.env`.
+
+```
+DOCKER_BASE=http://10.0.0.1:2375             # The port remote host is listening on
+LOG_FILE_PATH=/var/log/dockerbox-broker.log  # Set log file path
+```
+
+Start dockerbox broker daemon.
 
 ```sh
-./daemon.sh status
+service dockerbox-broker start
+```
+
+Check status.
+
+```sh
+service dockerbox-broker status
 ```
 
 Stop daemon.
 
 ```sh
-./daemon.sh stop
+service dockerbox-broker stop
 ```

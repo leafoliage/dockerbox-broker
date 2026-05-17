@@ -1,4 +1,4 @@
-module docker-broker
+module dockerbox-broker
 
 go 1.25
 

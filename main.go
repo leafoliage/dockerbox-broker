@@ -20,12 +20,12 @@ import (
 )
 
 const dockerHost = "10.0.0.1"
-const envFilePath = "/usr/local/etc/docker-broker/docker-broker.env"
+const envFilePath = "/usr/local/etc/dockerbox-broker/dockerbox-broker.env"
 
 // Defaults — overridden by .env file.
 var dockerBase = "http://10.0.0.1:2375"
-var logFilePath = "./docker-observe.log"
-var socketPath = "/var/run/docker-broker.sock"
+var logFilePath = "/var/log/dockerbox-broker.log"
+var socketPath = "/var/run/dockerbox-broker.sock"
 
 var debugEnabled bool
 
@@ -224,7 +224,7 @@ func runStatus() {
 	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot connect to %s: %v\n", socketPath, err)
-		fmt.Fprintf(os.Stderr, "is docker-broker running?\n")
+		fmt.Fprintf(os.Stderr, "is dockerbox-broker running?\n")
 		os.Exit(1)
 	}
 	defer conn.Close()
