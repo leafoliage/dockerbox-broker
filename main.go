@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -26,6 +27,7 @@ const envFilePath = "/usr/local/etc/dockerbox-broker/dockerbox-broker.env"
 var dockerBase = "http://10.0.0.1:2375"
 var logFilePath = "/var/log/dockerbox-broker.log"
 var socketPath = "/var/run/dockerbox-broker.sock"
+var maxRetries = 1
 
 var debugEnabled bool
 
@@ -576,6 +578,13 @@ func loadConfig() {
 	if v := os.Getenv("SOCKET_PATH"); v != "" {
 		socketPath = v
 	}
+	if v := os.Getenv("MAX_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxRetries = n
+		} else {
+			log.Fatalf("invalid MAX_RETRIES value: %q", v)
+		}
+	}
 }
 
 func runDaemon() {
@@ -593,13 +602,20 @@ func runDaemon() {
 
 	go serveStatus(reg)
 
+	retries := 0
 	for {
 		decoder, cleanup, err := connectAndReconcile(reg, "EXISTS")
 		if err != nil {
-			logError("%v — retrying in 5s...", err)
+			retries++
+			if retries > maxRetries {
+				logError("connection failed %d times consecutively, giving up", maxRetries)
+				os.Exit(1)
+			}
+			logError("%v — retrying in 5s... (attempt %d/%d)", err, retries, maxRetries)
 			time.Sleep(5 * time.Second)
 			continue
 		}
+		retries = 0
 		if err := consumeEvents(decoder, reg); err != nil {
 			logError("%v — reconnecting in 5s...", err)
 		}
