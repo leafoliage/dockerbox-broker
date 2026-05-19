@@ -10,10 +10,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -30,6 +32,8 @@ var socketPath = "/var/run/dockerbox-broker.sock"
 var maxRetries = 1
 
 var debugEnabled bool
+
+var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // --- Logging ---
 
@@ -208,7 +212,11 @@ func serveStatus(reg *ContainerRegistry) {
 	defer os.Remove(socketPath)
 
 	// Restrict access to root only.
-	os.Chmod(socketPath, 0600)
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		logError("status socket chmod %s: %v", socketPath, err)
+		ln.Close()
+		return
+	}
 
 	logDebug("status socket listening on %s", socketPath)
 
@@ -356,7 +364,7 @@ func startForwarders(ctx context.Context, name string, ports map[string][]PortBi
 
 func inspectContainer(id string) (*ContainerInspect, error) {
 	url := fmt.Sprintf("%s/containers/%s/json", dockerBase, id)
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("inspect request failed: %w", err)
 	}
@@ -455,7 +463,7 @@ func handleDie(event DockerEvent, reg *ContainerRegistry) {
 // Called once at startup and again after every event-stream reconnection.
 func reconcile(reg *ContainerRegistry, logPrefix string) error {
 	url := fmt.Sprintf("%s/containers/json", dockerBase)
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return fmt.Errorf("list containers: %w", err)
 	}
@@ -486,6 +494,9 @@ func reconcile(reg *ContainerRegistry, logPrefix string) error {
 	for _, c := range containers {
 		if known[c.ID] {
 			continue // already tracked, forwarders already running
+		}
+		if len(c.Names) == 0 {
+			continue
 		}
 		name := strings.TrimPrefix(c.Names[0], "/")
 
@@ -597,6 +608,14 @@ func runDaemon() {
 	fileLogger = log.New(f, "", 0)
 
 	logInfo("started; writing output to %s (debug=%v)", logFilePath, debugEnabled)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigCh
+		logInfo("shutting down")
+		os.Exit(0)
+	}()
 
 	reg := newRegistry()
 
