@@ -3,6 +3,7 @@ PREFIX?=        /usr/local
 SBINDIR?=       ${PREFIX}/sbin
 RCDDIR?=        ${PREFIX}/etc/rc.d
 ETCDIR?=        ${PREFIX}/etc/${NAME}
+BUILDDIR?=      build
 
 GO?=            go
 GOFLAGS?=
@@ -12,10 +13,11 @@ GOFLAGS?=
 all: build
 
 build:
-	${GO} build ${GOFLAGS} -o ${NAME} .
+	${GO} build ${GOFLAGS} -o ${BUILDDIR}/${NAME} .
 
 install: build
-	install -m 755 ${NAME} ${SBINDIR}/${NAME}
+	mkdir -p ${BUILDDIR}
+	install -m 755 ${BUILDDIR}/${NAME} ${SBINDIR}/${NAME}
 	install -m 755 rc.d/${NAME} ${RCDDIR}/${NAME}
 	mkdir -p ${ETCDIR}
 	install -m 644 .env.sample ${ETCDIR}/${NAME}.env

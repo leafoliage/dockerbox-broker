@@ -1,0 +1,49 @@
+#!/bin/sh
+
+# PROVIDE: dockerbox_broker
+# REQUIRE: FILESYSTEMS sysctl networking dockerbox
+
+. /etc/rc.subr
+
+name="dockerbox_broker"
+desc="Forward ports for Docker containers running on dockerbox"
+rcvar=dockerbox_broker_enable
+
+load_rc_config ${name}
+
+: ${dockerbox_broker_enable="NO"}
+
+command="/usr/local/sbin/dockerbox-broker"
+pidfile="/var/run/${name}.pid"
+command_interpreter=""
+
+start_cmd="${name}_start"
+stop_cmd="${name}_stop"
+status_cmd="${name}_status"
+
+dockerbox_broker_start()
+{
+    echo "Starting ${name}."
+    /usr/sbin/daemon -p ${pidfile} -f ${command}
+}
+
+dockerbox_broker_stop()
+{
+    echo "Stopping ${name}."
+    if [ -f ${pidfile} ]; then
+        kill $(cat ${pidfile}) && rm -f ${pidfile}
+    fi
+}
+
+dockerbox_broker_status()
+{
+    if [ -f ${pidfile} ] && kill -0 $(cat ${pidfile}) 2>/dev/null; then
+        echo "${name} is running as pid $(cat ${pidfile})."
+        echo
+        ${command} status
+    else
+        echo "${name} is not running."
+    fi
+}
+
+run_rc_command "$1"
