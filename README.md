@@ -19,6 +19,11 @@ Configure `/usr/local/etc/dockerbox-broker/dockerbox-broker.env`.
 ```
 DOCKER_BASE=http://10.0.0.1:2375             # The port remote host is listening on
 LOG_FILE_PATH=/var/log/dockerbox-broker.log  # Set log file path
+MAX_RETRIES=1                                # Connect Retry
+KEEPALIVE_IDLE=30
+KEEPALIVE_INTERVAL=5
+KEEPALIVE_COUNT=1
+CONNECT_TIMEOUT=1
 ```
 
 Start dockerbox broker daemon.
