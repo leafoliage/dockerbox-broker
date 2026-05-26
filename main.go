@@ -138,6 +138,14 @@ type StatusEntry struct {
 	Ports []string `json:"ports"` // ":<hostPort> -> <dockerHost>:<hostPort> (<containerPort>)"
 }
 
+// StatusResponse is the envelope written to the unix socket.
+// If Error is non-empty the client should display it and exit non-zero.
+type StatusResponse struct {
+	Connected bool          `json:"connected"`
+	Error     string        `json:"error,omitempty"`
+	Entries   []StatusEntry `json:"entries"`
+}
+
 // snapshot returns a sorted, read-safe slice of StatusEntry for all live containers.
 // Names are fetched on-demand via inspect so they are always current, even after
 // a container rename. The registry lock is released before any HTTP call.
@@ -201,11 +209,35 @@ func (r *ContainerRegistry) evict(live map[string]bool) {
 	}
 }
 
+
+// --- Daemon state ---
+
+// daemonState tracks whether the event stream connection to Docker is live.
+// serveStatus checks this before calling snapshot() to avoid hanging on
+// inspect requests when the Docker host is unreachable.
+type daemonState struct {
+	mu        sync.RWMutex
+	connected bool
+}
+
+func (s *daemonState) setConnected(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.connected = v
+}
+
+func (s *daemonState) isConnected() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.connected
+}
+
 // --- Unix socket status server ---
 
-// serveStatus listens on the Unix socket and writes a JSON snapshot of the
-// registry to each connecting client, then closes the connection.
-func serveStatus(reg *ContainerRegistry) {
+// serveStatus listens on the Unix socket and writes a StatusResponse to each
+// connecting client, then closes the connection. It checks daemonState before
+// calling snapshot() to avoid hanging when the Docker host is unreachable.
+func serveStatus(reg *ContainerRegistry, state *daemonState) {
 	// Remove stale socket from a previous run.
 	os.Remove(socketPath)
 
@@ -234,7 +266,13 @@ func serveStatus(reg *ContainerRegistry) {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
-			json.NewEncoder(c).Encode(reg.snapshot())
+			var resp StatusResponse
+			if !state.isConnected() {
+				resp = StatusResponse{Connected: false, Error: "docker host unreachable"}
+			} else {
+				resp = StatusResponse{Connected: true, Entries: reg.snapshot()}
+			}
+			json.NewEncoder(c).Encode(resp)
 		}(conn)
 	}
 }
@@ -251,22 +289,26 @@ func runStatus() {
 	}
 	defer conn.Close()
 
-	var entries []StatusEntry
-	if err := json.NewDecoder(conn).Decode(&entries); err != nil {
+	var resp StatusResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		fmt.Fprintf(os.Stderr, "error: bad response from daemon: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(entries) == 0 {
+	if !resp.Connected {
+		fmt.Fprintf(os.Stderr, "error: %s\n", resp.Error)
+		os.Exit(1)
+	}
+
+	if len(resp.Entries) == 0 {
 		fmt.Println("No active port forwarding entries.")
 		return
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "CONTAINER\tID\tFORWARDING")
-	for _, e := range entries {
+	for _, e := range resp.Entries {
 		if len(e.Ports) == 0 {
-			//fmt.Fprintf(w, "%s\t%s\t(none)\n", e.Name, e.ID)
 			continue
 		}
 		for i, p := range e.Ports {
@@ -673,13 +715,15 @@ func runDaemon() {
 	}()
 
 	reg := newRegistry()
+	state := &daemonState{}
 
-	go serveStatus(reg)
+	go serveStatus(reg, state)
 
 	retries := 0
 	for {
 		decoder, cleanup, err := connectAndReconcile(reg, "EXISTS")
 		if err != nil {
+			state.setConnected(false)
 			retries++
 			if retries >= maxRetries {
 				logError("connection failed %d times consecutively, giving up", maxRetries)
@@ -690,7 +734,9 @@ func runDaemon() {
 			continue
 		}
 		retries = 0
+		state.setConnected(true)
 		if err := consumeEvents(decoder, reg); err != nil {
+			state.setConnected(false)
 			logError("%v — reconnecting in 5s...", err)
 		}
 		cleanup()
