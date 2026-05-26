@@ -31,9 +31,15 @@ var logFilePath = "/var/log/dockerbox-broker.log"
 var socketPath = "/var/run/dockerbox-broker.sock"
 var maxRetries = 1
 
+// TCP keepalive settings for the event stream connection.
+var keepaliveIdle     = 30 // seconds of silence before first probe
+var keepaliveInterval = 5  // seconds between probes
+var keepaliveCount    = 1  // number of unanswered probes before giving up
+var connectTimeout    = 1
+
 var debugEnabled bool
 
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+var httpClient = &http.Client{Timeout: time.Duration(connectTimeout) * time.Second}
 
 // --- Logging ---
 
@@ -520,6 +526,27 @@ func reconcile(reg *ContainerRegistry, logPrefix string) error {
 	return nil
 }
 
+// newStreamClient builds an http.Client whose TCP connections have per-socket
+// keepalive configured via net.KeepAliveConfig
+func newStreamClient() *http.Client {
+	dialer := &net.Dialer{
+		Timeout: time.Duration(connectTimeout) * time.Second,
+		KeepAliveConfig: net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     time.Duration(keepaliveIdle) * time.Second,
+			Interval: time.Duration(keepaliveInterval) * time.Second,
+			Count:    keepaliveCount,
+		},
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext:           dialer.DialContext,
+			ResponseHeaderTimeout: time.Duration(connectTimeout) * time.Second,
+		},
+		// No overall Timeout — the stream runs indefinitely.
+	}
+}
+
 // --- Main event loop ---
 
 // connectAndReconcile opens the event stream first — so events are buffered in
@@ -528,7 +555,7 @@ func reconcile(reg *ContainerRegistry, logPrefix string) error {
 // buffered and will be processed by consumeEvents afterward, closing the gap.
 func connectAndReconcile(reg *ContainerRegistry, logPrefix string) (*json.Decoder, func(), error) {
 	url := fmt.Sprintf("%s/events", dockerBase)
-	resp, err := http.Get(url)
+	resp, err := newStreamClient().Get(url)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect failed: %w", err)
 	}
@@ -596,6 +623,34 @@ func loadConfig() {
 			log.Fatalf("invalid MAX_RETRIES value: %q", v)
 		}
 	}
+	if v := os.Getenv("KEEPALIVE_IDLE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			keepaliveIdle = n
+		} else {
+			log.Fatalf("invalid KEEPALIVE_IDLE value: %q", v)
+		}
+	}
+	if v := os.Getenv("KEEPALIVE_INTERVAL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			keepaliveInterval = n
+		} else {
+			log.Fatalf("invalid KEEPALIVE_INTERVAL value: %q", v)
+		}
+	}
+	if v := os.Getenv("KEEPALIVE_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			keepaliveCount = n
+		} else {
+			log.Fatalf("invalid KEEPALIVE_COUNT value: %q", v)
+		}
+	}
+	if v := os.Getenv("CONNECT_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			connectTimeout = n
+		} else {
+			log.Fatalf("invalid CONNECT_TIMEOUT value: %q", v)
+		}
+	}
 }
 
 func runDaemon() {
@@ -626,7 +681,7 @@ func runDaemon() {
 		decoder, cleanup, err := connectAndReconcile(reg, "EXISTS")
 		if err != nil {
 			retries++
-			if retries > maxRetries {
+			if retries >= maxRetries {
 				logError("connection failed %d times consecutively, giving up", maxRetries)
 				os.Exit(1)
 			}
