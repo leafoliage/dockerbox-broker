@@ -1,6 +1,6 @@
 # Dockerbox-Broker
 
-Dockerbox broker currently maintains port forwarding from localhost to remote TCP docker host for ports binded on the remote host.
+Dockerbox broker maintains port forwarding from localhost to a remote TCP Docker host for ports bound on the remote host.
 
 ## Prerequisites
 
@@ -17,13 +17,14 @@ make install
 Configure `/usr/local/etc/dockerbox-broker/dockerbox-broker.env`.
 
 ```
-DOCKER_BASE=http://10.0.0.1:2375             # The port remote host is listening on
-LOG_FILE_PATH=/var/log/dockerbox-broker.log  # Set log file path
-MAX_RETRIES=1                                # Connect Retry
-KEEPALIVE_IDLE=30                            # Connection keepalive idle timeout
-KEEPALIVE_INTERVAL=5                         # Connection keepalive probe interval
-KEEPALIVE_COUNT=1                            # Connection keepalive probe count
-CONNECT_TIMEOUT=1
+DOCKER_BASE=http://10.0.0.1:2375              # Remote Docker API endpoint (forward target host is derived from this)
+LOG_FILE_PATH=/var/log/dockerbox-broker.log   # Log file path
+SOCKET_PATH=/var/run/dockerbox-broker.sock    # Unix socket used by the status command
+MAX_RETRIES=1                                 # Consecutive connect failures before the daemon exits
+KEEPALIVE_IDLE=30                             # Seconds of silence before first keepalive probe
+KEEPALIVE_INTERVAL=5                          # Seconds between keepalive probes
+KEEPALIVE_COUNT=1                             # Unanswered probes before the connection is considered dead
+CONNECT_TIMEOUT=1                             # Docker API connect/request timeout in seconds
 ```
 
 Start dockerbox broker daemon.

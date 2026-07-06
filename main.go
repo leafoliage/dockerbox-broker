@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -22,7 +23,6 @@ import (
 	"github.com/joho/godotenv"
 )
 
-const dockerHost = "10.0.0.1"
 const envFilePath = "/usr/local/etc/dockerbox-broker/dockerbox-broker.env"
 
 // Defaults — overridden by .env file.
@@ -32,14 +32,18 @@ var socketPath = "/var/run/dockerbox-broker.sock"
 var maxRetries = 1
 
 // TCP keepalive settings for the event stream connection.
-var keepaliveIdle     = 30 // seconds of silence before first probe
-var keepaliveInterval = 5  // seconds between probes
-var keepaliveCount    = 1  // number of unanswered probes before giving up
-var connectTimeout    = 1
+var keepaliveIdle = 30    // seconds of silence before first probe
+var keepaliveInterval = 5 // seconds between probes
+var keepaliveCount = 1    // number of unanswered probes before giving up
+var connectTimeout = 1
 
 var debugEnabled bool
 
-var httpClient = &http.Client{Timeout: time.Duration(connectTimeout) * time.Second}
+// Derived from dockerBase in loadConfig; forwarders dial this host.
+var dockerHost string
+
+// Built in loadConfig so it picks up CONNECT_TIMEOUT.
+var httpClient *http.Client
 
 // --- Logging ---
 
@@ -111,9 +115,15 @@ func newRegistry() *ContainerRegistry {
 	return &ContainerRegistry{data: make(map[string]*ContainerEntry)}
 }
 
+// add registers a container entry. If the ID is already tracked (e.g. a
+// duplicate start event or a reconcile race), the old entry's forwarders are
+// cancelled first so they release their ports.
 func (r *ContainerRegistry) add(id string, entry *ContainerEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if old, ok := r.data[id]; ok {
+		old.cancel()
+	}
 	r.data[id] = entry
 }
 
@@ -209,7 +219,6 @@ func (r *ContainerRegistry) evict(live map[string]bool) {
 	}
 }
 
-
 // --- Daemon state ---
 
 // daemonState tracks whether the event stream connection to Docker is live.
@@ -241,20 +250,17 @@ func serveStatus(reg *ContainerRegistry, state *daemonState) {
 	// Remove stale socket from a previous run.
 	os.Remove(socketPath)
 
+	// Create the socket with root-only permissions (no chmod-after-listen
+	// window where other users could connect).
+	oldUmask := syscall.Umask(0o177)
 	ln, err := net.Listen("unix", socketPath)
+	syscall.Umask(oldUmask)
 	if err != nil {
 		logError("status socket listen %s: %v", socketPath, err)
 		return
 	}
 	defer ln.Close()
 	defer os.Remove(socketPath)
-
-	// Restrict access to root only.
-	if err := os.Chmod(socketPath, 0600); err != nil {
-		logError("status socket chmod %s: %v", socketPath, err)
-		ln.Close()
-		return
-	}
 
 	logDebug("status socket listening on %s", socketPath)
 
@@ -336,13 +342,6 @@ func handleConn(ctx context.Context, src net.Conn, target string) {
 	}
 	defer dst.Close()
 
-	// Close both connections when context is cancelled.
-	go func() {
-		<-ctx.Done()
-		src.Close()
-		dst.Close()
-	}()
-
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(dst, src)
@@ -352,7 +351,13 @@ func handleConn(ctx context.Context, src net.Conn, target string) {
 		io.Copy(src, dst)
 		done <- struct{}{}
 	}()
-	<-done
+
+	// Return when either direction finishes or the context is cancelled;
+	// the deferred Closes unblock the remaining io.Copy goroutines.
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 // forwardPort listens on listenAddr and forwards every connection to targetAddr.
@@ -464,13 +469,13 @@ func shortID(id string) string {
 
 // --- Event handling ---
 
-func handleStart(event DockerEvent, reg *ContainerRegistry) {
-	id := event.Actor.ID
-	name := event.Actor.Attributes["name"]
-
+// trackContainer inspects a container, registers it, and starts forwarders
+// for its host-port bindings. logPrefix distinguishes event-driven starts
+// ("START") from reconcile discoveries ("EXISTS").
+func trackContainer(reg *ContainerRegistry, id, name, logPrefix string) {
 	info, err := inspectContainer(id)
 	if err != nil {
-		logWarn("could not inspect %s (%s): %v", name, shortID(id), err)
+		logWarn("%s: could not inspect %s (%s): %v", logPrefix, name, shortID(id), err)
 		return
 	}
 
@@ -480,11 +485,15 @@ func handleStart(event DockerEvent, reg *ContainerRegistry) {
 	reg.add(id, &ContainerEntry{ports: ports, cancel: cancel})
 
 	if len(ports) > 0 {
-		logInfo("START   %-20s %s  ports: %s", name, shortID(id), formatPorts(ports))
+		logInfo("%-8s%-20s %s  ports: %s", logPrefix, name, shortID(id), formatPorts(ports))
 		startForwarders(ctx, name, ports)
 	} else {
 		cancel()
 	}
+}
+
+func handleStart(event DockerEvent, reg *ContainerRegistry) {
+	trackContainer(reg, event.Actor.ID, event.Actor.Attributes["name"], "START")
 }
 
 func handleDie(event DockerEvent, reg *ContainerRegistry) {
@@ -547,23 +556,7 @@ func reconcile(reg *ContainerRegistry, logPrefix string) error {
 			continue
 		}
 		name := strings.TrimPrefix(c.Names[0], "/")
-
-		info, err := inspectContainer(c.ID)
-		if err != nil {
-			logWarn("%s: could not inspect %s (%s): %v", logPrefix, name, shortID(c.ID), err)
-			continue
-		}
-
-		ports := info.NetworkSettings.Ports
-		ctx, cancel := context.WithCancel(context.Background())
-		reg.add(c.ID, &ContainerEntry{ports: ports, cancel: cancel})
-
-		if len(ports) > 0 {
-			logInfo("%-8s %-20s %s  ports: %s", logPrefix, name, shortID(c.ID), formatPorts(ports))
-			startForwarders(ctx, name, ports)
-		} else {
-			cancel()
-		}
+		trackContainer(reg, c.ID, name, logPrefix)
 	}
 	return nil
 }
@@ -693,6 +686,14 @@ func loadConfig() {
 			log.Fatalf("invalid CONNECT_TIMEOUT value: %q", v)
 		}
 	}
+
+	u, err := url.Parse(dockerBase)
+	if err != nil || u.Hostname() == "" {
+		log.Fatalf("invalid DOCKER_BASE value: %q", dockerBase)
+	}
+	dockerHost = u.Hostname()
+
+	httpClient = &http.Client{Timeout: time.Duration(connectTimeout) * time.Second}
 }
 
 func runDaemon() {
@@ -711,6 +712,7 @@ func runDaemon() {
 	go func() {
 		<-sigCh
 		logInfo("shutting down")
+		os.Remove(socketPath)
 		os.Exit(0)
 	}()
 

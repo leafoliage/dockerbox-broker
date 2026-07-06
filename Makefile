@@ -16,11 +16,10 @@ build:
 	${GO} build ${GOFLAGS} -o ${BUILDDIR}/${NAME} .
 
 install: build
-	mkdir -p ${BUILDDIR}
 	install -m 755 ${BUILDDIR}/${NAME} ${SBINDIR}/${NAME}
 	install -m 755 rc.d/${NAME} ${RCDDIR}/${NAME}
 	mkdir -p ${ETCDIR}
-	install -m 644 .env.sample ${ETCDIR}/${NAME}.env
+	[ -f ${ETCDIR}/${NAME}.env ] || install -m 644 .env.sample ${ETCDIR}/${NAME}.env
 
 clean:
-	rm -f ${NAME}
+	rm -rf ${BUILDDIR}
