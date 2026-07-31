@@ -146,7 +146,8 @@ type StatusResponse struct {
 	Entries   []StatusEntry `json:"entries"`
 }
 
-// snapshot returns a sorted, read-safe slice of StatusEntry for all live containers.
+// snapshot returns a sorted, read-safe slice of StatusEntry for every live
+// container that has at least one active forwarder.
 // Names are fetched on-demand via inspect so they are always current, even after
 // a container rename. The registry lock is released before any HTTP call.
 func (r *ContainerRegistry) snapshot() []StatusEntry {
@@ -178,6 +179,9 @@ func (r *ContainerRegistry) snapshot() []StatusEntry {
 				}
 				ports = append(ports, fmt.Sprintf(":%s -> %s:%s (%s)", b.HostPort, dockerHost, b.HostPort, containerPort))
 			}
+		}
+		if len(ports) == 0 {
+			continue
 		}
 		sort.Strings(ports)
 		entries = append(entries, StatusEntry{Name: name, ID: shortID(item.id), Ports: ports})
@@ -308,9 +312,6 @@ func runStatus() {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "CONTAINER\tID\tFORWARDING")
 	for _, e := range resp.Entries {
-		if len(e.Ports) == 0 {
-			continue
-		}
 		for i, p := range e.Ports {
 			if i == 0 {
 				fmt.Fprintf(w, "%s\t%s\t%s\n", e.Name, e.ID, p)
