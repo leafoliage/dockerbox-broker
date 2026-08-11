@@ -24,6 +24,7 @@ KEEPALIVE_IDLE=30                            # Connection keepalive idle timeout
 KEEPALIVE_INTERVAL=5                         # Connection keepalive probe interval
 KEEPALIVE_COUNT=1                            # Connection keepalive probe count
 CONNECT_TIMEOUT=1
+UDP_IDLE_TIMEOUT=90                          # Seconds before an idle UDP session is dropped
 ```
 
 Start dockerbox broker daemon.
@@ -43,3 +44,7 @@ Stop daemon.
 ```sh
 service dockerbox-broker stop
 ```
+
+## Known Issues
+
+* Containers see the broker's address as the source of forwarded traffic, not the original client's — the same as with Docker's own `docker-proxy`. Per-client IP allowlists or logging inside a container will not work as they would if the container ran locally.

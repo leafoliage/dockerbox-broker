@@ -22,8 +22,10 @@ import (
 	"github.com/joho/godotenv"
 )
 
-const dockerHost = "10.0.0.1"
 const envFilePath = "/usr/local/etc/dockerbox-broker/dockerbox-broker.env"
+
+// Host that published container ports are forwarded to.
+var dockerHost = "10.0.0.1"
 
 // Defaults — overridden by .env file.
 var dockerBase = "http://10.0.0.1:2375"
@@ -36,6 +38,9 @@ var keepaliveIdle     = 30 // seconds of silence before first probe
 var keepaliveInterval = 5  // seconds between probes
 var keepaliveCount    = 1  // number of unanswered probes before giving up
 var connectTimeout    = 1
+
+// Seconds a UDP session may sit idle before its socket is reclaimed.
+var udpIdleTimeout = 90
 
 var debugEnabled bool
 
@@ -173,7 +178,15 @@ func (r *ContainerRegistry) snapshot() []StatusEntry {
 		name := strings.TrimPrefix(info.Name, "/")
 		var ports []string
 		for containerPort, bindings := range item.ports {
+			// Mirrors the filtering in startForwarders, so status only ever
+			// lists bindings that really have a forwarder behind them.
+			if _, supported := protoOf(containerPort); !supported {
+				continue
+			}
 			for _, b := range bindings {
+				if b.HostPort == "" {
+					continue
+				}
 				if b.HostIP != "" && b.HostIP != "0.0.0.0" {
 					continue // skip duplicate IPv6 bindings
 				}
@@ -356,9 +369,9 @@ func handleConn(ctx context.Context, src net.Conn, target string) {
 	<-done
 }
 
-// forwardPort listens on listenAddr and forwards every connection to targetAddr.
+// forwardTCP listens on listenAddr and forwards every connection to targetAddr.
 // Stops accepting when ctx is cancelled.
-func forwardPort(ctx context.Context, listenAddr, targetAddr string) {
+func forwardTCP(ctx context.Context, listenAddr, targetAddr string) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		logError("forwarder: listen %s: %v", listenAddr, err)
@@ -386,10 +399,133 @@ func forwardPort(ctx context.Context, listenAddr, targetAddr string) {
 	}
 }
 
-// startForwarders spawns one forwardPort goroutine per host-port binding.
+// Largest possible UDP payload, so a datagram is never silently truncated.
+const udpBufSize = 65507
+
+// udpSession is one client's leg of a UDP forward: a socket dialed to the
+// target, carrying traffic for exactly one client address.
+type udpSession struct {
+	conn   net.Conn
+	client net.Addr
+}
+
+// forwardUDP listens on listenAddr and relays datagrams to targetAddr.
+//
+// UDP offers neither Accept() nor end-of-stream, so both jobs the kernel does
+// for TCP have to be done here. Demultiplexing: every client address gets its
+// own socket dialed to the target, so a reply arriving on that socket can be
+// traced back to the client that earned it. Lifetime: a session is closed once
+// it has gone udpIdleTimeout seconds without traffic, since silence is the only
+// hint UDP gives that an exchange is over.
+func forwardUDP(ctx context.Context, listenAddr, targetAddr string) {
+	ln, err := net.ListenPacket("udp", listenAddr)
+	if err != nil {
+		logError("forwarder: listen udp %s: %v", listenAddr, err)
+		return
+	}
+	logDebug("forward: listening on %s/udp -> %s", listenAddr, targetAddr)
+	relayUDP(ctx, ln, targetAddr)
+}
+
+// relayUDP is the datagram loop behind forwardUDP, split out so it can be
+// driven with a caller-supplied listener.
+func relayUDP(ctx context.Context, ln net.PacketConn, targetAddr string) {
+	var mu sync.Mutex
+	sessions := make(map[string]*udpSession)
+
+	// Unblock ReadFrom() and drop every session when context is cancelled.
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+		mu.Lock()
+		for _, s := range sessions {
+			s.conn.Close()
+		}
+		mu.Unlock()
+	}()
+
+	idle := time.Duration(udpIdleTimeout) * time.Second
+	buf := make([]byte, udpBufSize)
+
+	for {
+		n, client, err := ln.ReadFrom(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			logDebug("forward: read error on %s/udp: %v", ln.LocalAddr(), err)
+			return
+		}
+
+		key := client.String()
+
+		mu.Lock()
+		sess, ok := sessions[key]
+		if !ok {
+			conn, derr := net.Dial("udp", targetAddr)
+			if derr != nil {
+				mu.Unlock()
+				logDebug("forward: dial udp %s failed: %v", targetAddr, derr)
+				continue
+			}
+			sess = &udpSession{conn: conn, client: client}
+			sessions[key] = sess
+			logDebug("forward: udp session %s -> %s opened", key, targetAddr)
+
+			// Carry replies back to this client until the session goes idle,
+			// the target refuses us, or the forwarder shuts down. Whichever
+			// happens, the session reaps itself.
+			go func(s *udpSession, key string) {
+				defer func() {
+					mu.Lock()
+					delete(sessions, key)
+					mu.Unlock()
+					s.conn.Close()
+					logDebug("forward: udp session %s closed", key)
+				}()
+
+				rbuf := make([]byte, udpBufSize)
+				for {
+					n, err := s.conn.Read(rbuf)
+					if err != nil {
+						return
+					}
+					if _, err := ln.WriteTo(rbuf[:n], s.client); err != nil {
+						return
+					}
+				}
+			}(sess, key)
+		}
+		mu.Unlock()
+
+		// Traffic in either direction keeps the session alive; the reply
+		// goroutine is blocked on Read, so its deadline is the idle clock.
+		sess.conn.SetReadDeadline(time.Now().Add(idle))
+
+		if _, err := sess.conn.Write(buf[:n]); err != nil {
+			logDebug("forward: write to %s failed: %v", targetAddr, err)
+		}
+	}
+}
+
+// protoOf extracts the protocol from a Docker port key such as "53/udp", and
+// reports whether the broker can forward it. A key with no protocol means tcp,
+// which is Docker's own default.
+func protoOf(containerPort string) (string, bool) {
+	proto := "tcp"
+	if i := strings.Index(containerPort, "/"); i >= 0 {
+		proto = containerPort[i+1:]
+	}
+	return proto, proto == "tcp" || proto == "udp"
+}
+
+// startForwarders spawns one forwarder goroutine per host-port binding, picking
+// the transport from the binding's protocol.
 func startForwarders(ctx context.Context, name string, ports map[string][]PortBinding) {
 
 	for containerPort, bindings := range ports {
+		proto, supported := protoOf(containerPort)
+
 		for _, b := range bindings {
 			if b.HostPort == "" {
 				continue
@@ -398,13 +534,23 @@ func startForwarders(ctx context.Context, name string, ports map[string][]PortBi
 				logDebug("forward: skipping non-default binding %s:%s", b.HostIP, b.HostPort)
 				continue
 			}
+			if !supported {
+				logWarn("forward: %s binding %s (host port %s) uses unsupported protocol %q — not forwarded",
+					name, containerPort, b.HostPort, proto)
+				continue
+			}
+
+			forward := forwardTCP
+			if proto == "udp" {
+				forward = forwardUDP
+			}
 
 			listenAddr := fmt.Sprintf(":%s", b.HostPort)
 			targetAddr := fmt.Sprintf("%s:%s", dockerHost, b.HostPort)
 
 			logInfo("FORWARD %-20s :%s -> %s:%s (%s)", name, b.HostPort, dockerHost, b.HostPort, containerPort)
 
-			go forwardPort(ctx, listenAddr, targetAddr)
+			go forward(ctx, listenAddr, targetAddr)
 		}
 	}
 }
@@ -692,6 +838,13 @@ func loadConfig() {
 			connectTimeout = n
 		} else {
 			log.Fatalf("invalid CONNECT_TIMEOUT value: %q", v)
+		}
+	}
+	if v := os.Getenv("UDP_IDLE_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			udpIdleTimeout = n
+		} else {
+			log.Fatalf("invalid UDP_IDLE_TIMEOUT value: %q", v)
 		}
 	}
 }
