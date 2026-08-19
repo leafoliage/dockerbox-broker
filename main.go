@@ -362,13 +362,6 @@ func handleConn(ctx context.Context, src net.Conn, target string) {
 	}
 	defer dst.Close()
 
-	// Close both connections when context is cancelled.
-	go func() {
-		<-ctx.Done()
-		src.Close()
-		dst.Close()
-	}()
-
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(dst, src)
@@ -378,7 +371,11 @@ func handleConn(ctx context.Context, src net.Conn, target string) {
 		io.Copy(src, dst)
 		done <- struct{}{}
 	}()
-	<-done
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 // forwardTCP listens on listenAddr and forwards every connection to targetAddr.
