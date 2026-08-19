@@ -34,10 +34,10 @@ var socketPath = "/var/run/dockerbox-broker.sock"
 var maxRetries = 1
 
 // TCP keepalive settings for the event stream connection.
-var keepaliveIdle     = 30 // seconds of silence before first probe
-var keepaliveInterval = 5  // seconds between probes
-var keepaliveCount    = 1  // number of unanswered probes before giving up
-var connectTimeout    = 1
+var keepaliveIdle = 30    // seconds of silence before first probe
+var keepaliveInterval = 5 // seconds between probes
+var keepaliveCount = 1    // number of unanswered probes before giving up
+var connectTimeout = 1
 
 // Seconds a UDP session may sit idle before its socket is reclaimed.
 var udpIdleTimeout = 90
@@ -90,8 +90,11 @@ type PortBinding struct {
 
 // ContainerInspect is a minimal slice of docker inspect output.
 type ContainerInspect struct {
-	ID              string `json:"Id"`
-	Name            string `json:"Name"`
+	ID     string `json:"Id"`
+	Name   string `json:"Name"`
+	Config struct {
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
 	NetworkSettings struct {
 		Ports map[string][]PortBinding `json:"Ports"`
 	} `json:"NetworkSettings"`
@@ -104,6 +107,7 @@ type ContainerInspect struct {
 
 type ContainerEntry struct {
 	ports  map[string][]PortBinding
+	binds  bindMap
 	cancel context.CancelFunc
 }
 
@@ -140,7 +144,7 @@ func (r *ContainerRegistry) remove(id string) (map[string][]PortBinding, bool) {
 type StatusEntry struct {
 	Name  string   `json:"name"`
 	ID    string   `json:"id"`
-	Ports []string `json:"ports"` // ":<hostPort> -> <dockerHost>:<hostPort> (<containerPort>)"
+	Ports []string `json:"ports"` // "<listenIP>:<hostPort> -> <dockerHost>:<hostPort> (<containerPort>)"
 }
 
 // StatusResponse is the envelope written to the unix socket.
@@ -161,10 +165,11 @@ func (r *ContainerRegistry) snapshot() []StatusEntry {
 	type idAndPorts struct {
 		id    string
 		ports map[string][]PortBinding
+		binds bindMap
 	}
 	items := make([]idAndPorts, 0, len(r.data))
 	for id, e := range r.data {
-		items = append(items, idAndPorts{id: id, ports: e.ports})
+		items = append(items, idAndPorts{id: id, ports: e.ports, binds: e.binds})
 	}
 	r.mu.RUnlock()
 
@@ -180,17 +185,25 @@ func (r *ContainerRegistry) snapshot() []StatusEntry {
 		for containerPort, bindings := range item.ports {
 			// Mirrors the filtering in startForwarders, so status only ever
 			// lists bindings that really have a forwarder behind them.
-			if _, supported := protoOf(containerPort); !supported {
+			proto, supported := protoOf(containerPort)
+			if !supported {
 				continue
 			}
 			for _, b := range bindings {
 				if b.HostPort == "" {
 					continue
 				}
-				if b.HostIP != "" && b.HostIP != "0.0.0.0" {
-					continue // skip duplicate IPv6 bindings
+				listenIP, forwardable := listenIPOf(b.HostIP)
+				if !forwardable {
+					continue
 				}
-				ports = append(ports, fmt.Sprintf(":%s -> %s:%s (%s)", b.HostPort, dockerHost, b.HostPort, containerPort))
+				if ip, ok := item.binds.listenIP(b.HostPort, proto); ok {
+					listenIP = ip
+				}
+				ports = append(ports, fmt.Sprintf("%s -> %s (%s)",
+					net.JoinHostPort(listenIP, b.HostPort),
+					net.JoinHostPort(dockerHost, b.HostPort),
+					containerPort))
 			}
 		}
 		if len(ports) == 0 {
@@ -225,7 +238,6 @@ func (r *ContainerRegistry) evict(live map[string]bool) {
 		}
 	}
 }
-
 
 // --- Daemon state ---
 
@@ -519,9 +531,146 @@ func protoOf(containerPort string) (string, bool) {
 	return proto, proto == "tcp" || proto == "udp"
 }
 
+// listenIPOf maps a binding's HostIp onto the address the broker listens on
+// locally, and reports whether the binding can be forwarded at all. An empty
+// string means the wildcard, i.e. every local interface.
+//
+// Only "::" is refused, and only because Docker reports it alongside "0.0.0.0"
+// for a wildcard publish; honouring both would have the second forwarder
+// collide with the dual-stack listener the first one opened.
+func listenIPOf(hostIP string) (string, bool) {
+	switch hostIP {
+	case "", "0.0.0.0":
+		return "", true
+	case "::":
+		return "", false
+	}
+	if net.ParseIP(hostIP) == nil {
+		return "", false
+	}
+	return hostIP, true
+}
+
+// --- Bind label ---
+
+// bindLabel is the container label that says which local address each published
+// port should be listened on.
+const bindLabel = "dockerbox.bind"
+
+// bindMap is a parsed dockerbox.bind label: a default address for every
+// published port, plus per-host-port overrides keyed by "8080" or "8080/udp".
+type bindMap struct {
+	def   string
+	ports map[string]string
+}
+
+// listenIP returns the address a published host port should be listened on, and
+// whether the label had anything to say about it at all. The most specific
+// entry wins: a port with a protocol, then the bare port, then the default.
+func (m bindMap) listenIP(hostPort, proto string) (string, bool) {
+	if ip, ok := m.ports[hostPort+"/"+proto]; ok {
+		return ip, true
+	}
+	if ip, ok := m.ports[hostPort]; ok {
+		return ip, true
+	}
+	if m.def != "" {
+		return m.def, true
+	}
+	return "", false
+}
+
+// parseBindLabel reads a dockerbox.bind label. Entries are comma-separated and
+// take one of three forms:
+//
+//	192.168.88.220           every published port is listened for here
+//	192.168.88.220:8080      host port 8080, either protocol
+//	10.0.0.5:53/udp          host port 53, udp only
+//
+// An IPv6 address takes brackets when a port follows it: [2001:db8::5]:8080.
+//
+// Addresses name interfaces of the machine the broker runs on, not of the
+// dockerbox — the dial target is always dockerHost.
+//
+// A malformed entry is reported and skipped rather than failing the whole
+// label, so one typo cannot take a container's other ports down with it.
+func parseBindLabel(value string) (bindMap, []string) {
+	m := bindMap{ports: make(map[string]string)}
+	var problems []string
+
+	for _, entry := range strings.Split(value, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+
+		// Take a trailing /proto off first, so the slash can never be read as
+		// part of the address.
+		spec, proto := entry, ""
+		if i := strings.LastIndex(entry, "/"); i >= 0 {
+			spec, proto = entry[:i], entry[i+1:]
+			if proto != "tcp" && proto != "udp" {
+				problems = append(problems, fmt.Sprintf("%q: protocol must be tcp or udp", entry))
+				continue
+			}
+		}
+
+		// A bare address sets the default for every port. Brackets are
+		// accepted here too, so [2001:db8::5] and 2001:db8::5 both work.
+		bare := strings.TrimSuffix(strings.TrimPrefix(spec, "["), "]")
+		if net.ParseIP(bare) != nil {
+			if proto != "" {
+				problems = append(problems, fmt.Sprintf("%q: a default applies to every port, so it takes no protocol", entry))
+				continue
+			}
+			if m.def != "" {
+				problems = append(problems, fmt.Sprintf("%q: default address is already %s", entry, m.def))
+				continue
+			}
+			m.def = bare
+			continue
+		}
+
+		host, port, err := net.SplitHostPort(spec)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%q: want an address, address:port, or address:port/proto", entry))
+			continue
+		}
+		if net.ParseIP(host) == nil {
+			problems = append(problems, fmt.Sprintf("%q: %q is not an IP address", entry, host))
+			continue
+		}
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			problems = append(problems, fmt.Sprintf("%q: %q is not a port number", entry, port))
+			continue
+		}
+
+		key := port
+		if proto != "" {
+			key += "/" + proto
+		}
+		if prev, dup := m.ports[key]; dup {
+			problems = append(problems, fmt.Sprintf("%q: host port %s is already bound to %s", entry, key, prev))
+			continue
+		}
+		m.ports[key] = host
+	}
+	return m, problems
+}
+
+// bindsFor parses a container's bind label, logging anything wrong with it
+// against the container's name.
+func bindsFor(name string, info *ContainerInspect) bindMap {
+	binds, problems := parseBindLabel(info.Config.Labels[bindLabel])
+	for _, p := range problems {
+		logWarn("%s: bad %s entry %s", name, bindLabel, p)
+	}
+	return binds
+}
+
 // startForwarders spawns one forwarder goroutine per host-port binding, picking
 // the transport from the binding's protocol.
-func startForwarders(ctx context.Context, name string, ports map[string][]PortBinding) {
+func startForwarders(ctx context.Context, name string, ports map[string][]PortBinding, binds bindMap) {
 
 	for containerPort, bindings := range ports {
 		proto, supported := protoOf(containerPort)
@@ -530,8 +679,9 @@ func startForwarders(ctx context.Context, name string, ports map[string][]PortBi
 			if b.HostPort == "" {
 				continue
 			}
-			if b.HostIP != "" && b.HostIP != "0.0.0.0" {
-				logDebug("forward: skipping non-default binding %s:%s", b.HostIP, b.HostPort)
+			listenIP, forwardable := listenIPOf(b.HostIP)
+			if !forwardable {
+				logDebug("forward: skipping binding %s:%s (%s)", b.HostIP, b.HostPort, containerPort)
 				continue
 			}
 			if !supported {
@@ -540,15 +690,26 @@ func startForwarders(ctx context.Context, name string, ports map[string][]PortBi
 				continue
 			}
 
+			// The label names an address on this machine and so overrides the
+			// one carried by the binding, which names an address inside the
+			// dockerbox.
+			if ip, ok := binds.listenIP(b.HostPort, proto); ok {
+				listenIP = ip
+			} else if b.HostIP != "" && b.HostIP != "0.0.0.0" {
+				logWarn("forward: %s binding %s is published on %s inside the dockerbox, but the dial goes to %s — "+
+					"publish it on the wildcard and set %s instead",
+					name, containerPort, b.HostIP, dockerHost, bindLabel)
+			}
+
 			forward := forwardTCP
 			if proto == "udp" {
 				forward = forwardUDP
 			}
 
-			listenAddr := fmt.Sprintf(":%s", b.HostPort)
-			targetAddr := fmt.Sprintf("%s:%s", dockerHost, b.HostPort)
+			listenAddr := net.JoinHostPort(listenIP, b.HostPort)
+			targetAddr := net.JoinHostPort(dockerHost, b.HostPort)
 
-			logInfo("FORWARD %-20s :%s -> %s:%s (%s)", name, b.HostPort, dockerHost, b.HostPort, containerPort)
+			logInfo("FORWARD %-20s %s -> %s (%s)", name, listenAddr, targetAddr, containerPort)
 
 			go forward(ctx, listenAddr, targetAddr)
 		}
@@ -588,11 +749,11 @@ func formatPorts(ports map[string][]PortBinding) string {
 			continue
 		}
 		for _, b := range bindings {
-			hostIP := b.HostIP
-			if hostIP == "" || hostIP == "0.0.0.0" {
-				hostIP = "*"
+			if b.HostIP == "" || b.HostIP == "0.0.0.0" {
+				parts = append(parts, fmt.Sprintf("*:%s -> %s", b.HostPort, containerPort))
+				continue
 			}
-			parts = append(parts, fmt.Sprintf("%s:%s -> %s", hostIP, b.HostPort, containerPort))
+			parts = append(parts, fmt.Sprintf("%s -> %s", net.JoinHostPort(b.HostIP, b.HostPort), containerPort))
 		}
 	}
 	if len(parts) == 0 {
@@ -622,13 +783,14 @@ func handleStart(event DockerEvent, reg *ContainerRegistry) {
 	}
 
 	ports := info.NetworkSettings.Ports
+	binds := bindsFor(name, info)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	reg.add(id, &ContainerEntry{ports: ports, cancel: cancel})
+	reg.add(id, &ContainerEntry{ports: ports, binds: binds, cancel: cancel})
 
 	if len(ports) > 0 {
 		logInfo("START   %-20s %s  ports: %s", name, shortID(id), formatPorts(ports))
-		startForwarders(ctx, name, ports)
+		startForwarders(ctx, name, ports, binds)
 	} else {
 		cancel()
 	}
@@ -702,12 +864,14 @@ func reconcile(reg *ContainerRegistry, logPrefix string) error {
 		}
 
 		ports := info.NetworkSettings.Ports
+		binds := bindsFor(name, info)
+
 		ctx, cancel := context.WithCancel(context.Background())
-		reg.add(c.ID, &ContainerEntry{ports: ports, cancel: cancel})
+		reg.add(c.ID, &ContainerEntry{ports: ports, binds: binds, cancel: cancel})
 
 		if len(ports) > 0 {
 			logInfo("%-8s %-20s %s  ports: %s", logPrefix, name, shortID(c.ID), formatPorts(ports))
-			startForwarders(ctx, name, ports)
+			startForwarders(ctx, name, ports, binds)
 		} else {
 			cancel()
 		}
