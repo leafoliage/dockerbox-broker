@@ -55,7 +55,7 @@ docker run -p 8080:80 -l dockerbox.bind=192.168.88.220 nginx
 
 The broker then listens on `192.168.88.220:8080` and forwards to `10.0.0.1:8080` as usual.
 
-Publish on the wildcard inside the dockerbox and let the label choose the address here. The two are not interchangeable: `-p` names an address of the dockerbox, the label names an address of this machine. A port published on a specific address inside the dockerbox stays reachable only at that address, while the broker's dial goes to `DOCKER_BASE` — so the forward accepts your connection and then has nowhere to send it.
+Publish on the wildcard inside the dockerbox and let the label choose the address here. The two are not interchangeable: `-p` names an address of the dockerbox, the label names an address of this machine. A port published on a specific address inside dockerbox stays reachable only at that address, while the broker's dial goes to `DOCKER_BASE` — so the forward accepts your connection and then has nowhere to send it.
 
 ### Label syntax
 
@@ -75,7 +75,7 @@ docker run -p 80:80 -p 443:443 -p 53:53/udp \
   mycontainer
 ```
 
-That serves 80 and 443 on `192.168.88.220` and keeps DNS to this host's loopback. Loopback is fine in a label — only the listen side is local, and the dial still goes to the dockerbox.
+That serves 80 and 443 on `192.168.88.220` and keeps DNS to this host's loopback.
 
 An IPv6 address takes brackets when a port follows it, since `2001:db8::5:8080` is otherwise a valid address in its own right:
 
@@ -85,11 +85,7 @@ An IPv6 address takes brackets when a port follows it, since `2001:db8::5:8080` 
 
 A malformed entry is logged and skipped; the container's other ports are unaffected. Ports with no matching entry keep the default behaviour, so adding the label to one container changes nothing for the rest.
 
-### Bindings published on a specific address in the dockerbox
-
-`-p <IP>:8080:80` is honoured — the broker mirrors it and listens on `<IP>:8080` — but the dial still goes to `10.0.0.1:8080`, so it only works if the port is reachable there too, e.g. via a DNAT rule inside the dockerbox. Without one, prefer the label.
-
-Every address is mirrored the same way, loopback included: the dial target is always `DOCKER_BASE`, never the bound address, so a listener on `127.0.0.1` forwards to the dockerbox rather than back into the broker. The one exception is `::`, which Docker reports alongside `0.0.0.0` for a wildcard publish — honouring both would have the second forwarder collide with the dual-stack listener the first one opened.
+`-p <IP>:8080:80` is honoured, i.e., if no label is provided, the broker listens on `<IP>:8080` on host instead of ignoring. Please note that the broker still connects to `DOCKER_BASE` (set in env), so it only works if the port is reachable there too, e.g. via a DNAT rule inside the dockerbox. Without one, prefer the label.
 
 ## Known Issues
 
