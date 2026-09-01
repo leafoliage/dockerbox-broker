@@ -1,4 +1,4 @@
-module dockerbox-broker
+module github.com/leafoliage/dockerbox-broker
 
 go 1.25
 
